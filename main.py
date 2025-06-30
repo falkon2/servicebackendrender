@@ -178,6 +178,8 @@ async def get_total_count(access_token: str, endpoint: str) -> int:
             break
             
     return total_count
+
+async def make_reddit_api_request(access_token: str, endpoint: str) -> Dict[str, Any]:
     """Make authenticated request to Reddit API"""
     headers = {
         "Authorization": f"Bearer {access_token}",
