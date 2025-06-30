@@ -158,23 +158,32 @@ async def get_total_count(access_token: str, endpoint: str) -> int:
     """Get total count of posts or comments by fetching all pages"""
     total_count = 0
     after = None
+    limit = 100
     
     while True:
-        # Build URL with pagination
-        url = f"{endpoint}?limit=100"
+        # Build URL with pagination parameters
+        url = f"{endpoint}?limit={limit}"
         if after:
             url += f"&after={after}"
             
-        data = await make_reddit_api_request(access_token, url)
-        children = data["data"]["children"]
-        
-        if not children:
-            break
+        try:
+            data = await make_reddit_api_request(access_token, url)
+            children = data["data"].get("children", [])
             
-        total_count += len(children)
-        after = data["data"].get("after")
-        
-        if not after:
+            if not children:
+                break
+                
+            # Count items in this batch
+            for item in children:
+                total_count += 1
+            
+            # Get pagination token for next batch
+            after = data["data"].get("after")
+            if not after:
+                break
+                
+        except Exception as e:
+            logger.error(f"Error fetching page from {endpoint}: {str(e)}")
             break
             
     return total_count
@@ -297,15 +306,22 @@ async def get_user_profile(session_id: str):
     try:
         # Get user identity
         me_data = await make_reddit_api_request(access_token, "/api/v1/me")
+        logger.info(f"Fetching stats for user: {me_data.get('name', 'Unknown')}")
         
         # Get user posts count (get all posts to count them properly)
+        logger.info("Starting posts count...")
         posts_count = await get_total_count(access_token, "/user/self/submitted")
+        logger.info(f"Total posts found: {posts_count}")
         
         # Get user comments count (get all comments to count them properly)
+        logger.info("Starting comments count...")
         comments_count = await get_total_count(access_token, "/user/self/comments")
+        logger.info(f"Total comments found: {comments_count}")
         
         created_utc = me_data.get("created_utc", 0)
         created_date = datetime.fromtimestamp(created_utc).strftime('%Y-%m-%d') if created_utc else "Unknown"
+        
+        logger.info(f"Profile complete - Posts: {posts_count}, Comments: {comments_count}")
         
         return UserProfile(
             username=me_data.get("name", "Unknown"),
@@ -396,6 +412,44 @@ async def logout(session_id: str):
         del sessions[session_id]
     
     return {"message": "Logged out successfully"}
+
+async def get_all_user_items(access_token: str, endpoint: str, max_items: int = None) -> List[Dict[str, Any]]:
+    """Get all posts or comments for a user by fetching all pages"""
+    all_items = []
+    after = None
+    limit = 100
+    
+    while True:
+        # Build URL with pagination parameters
+        url = f"{endpoint}?limit={limit}"
+        if after:
+            url += f"&after={after}"
+            
+        try:
+            data = await make_reddit_api_request(access_token, url)
+            children = data["data"].get("children", [])
+            
+            if not children:
+                break
+                
+            # Add items from this batch
+            for item in children:
+                all_items.append(item["data"])
+                if max_items and len(all_items) >= max_items:
+                    return all_items
+            
+            # Get pagination token for next batch
+            after = data["data"].get("after")
+            if not after:
+                break
+                
+        except Exception as e:
+            logger.error(f"Error fetching page from {endpoint}: {str(e)}")
+            break
+            
+    return all_items
+
+# ...existing code...
 
 if __name__ == "__main__":
     import uvicorn
