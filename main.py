@@ -4,9 +4,12 @@ Secure FastAPI Backend for Reddit OAuth2 Web App
 
 This backend implements OAuth2 Authorization Code Flow for secure Reddit authentication.
 Users authenticate through Reddit's OAuth2 flow without exposing credentials.
-"""
-
-import os
+    except Exception as e:
+        logger.error(f"Callback error: {str(e)}")
+        return RedirectResponse(
+            url=f"{FRONTEND_URL}/?error=callback_failed",
+            status_code=302
+        )mport os
 import secrets
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, Depends
@@ -48,7 +51,7 @@ if missing_vars:
 # CORS configuration
 origins = [
     "http://localhost:3000",
-    "https://your-app.vercel.app",  # Replace with your actual Vercel domain
+    "https://redditstatschecker.onrender.com",  # Your frontend URL
     FRONTEND_URL
 ]
 
@@ -206,7 +209,7 @@ async def auth_callback(code: str, state: str, error: Optional[str] = None):
     if error:
         logger.error(f"OAuth2 error: {error}")
         return RedirectResponse(
-            url=f"{FRONTEND_URL}/auth/error?error={error}",
+            url=f"{FRONTEND_URL}/?error={error}",
             status_code=302
         )
     
@@ -214,7 +217,7 @@ async def auth_callback(code: str, state: str, error: Optional[str] = None):
     if state not in sessions or sessions[state]["used"]:
         logger.error(f"Invalid or used state: {state}")
         return RedirectResponse(
-            url=f"{FRONTEND_URL}/auth/error?error=invalid_state",
+            url=f"{FRONTEND_URL}/?error=invalid_state",
             status_code=302
         )
     
@@ -238,7 +241,7 @@ async def auth_callback(code: str, state: str, error: Optional[str] = None):
         
         # Redirect to frontend with session ID
         return RedirectResponse(
-            url=f"{FRONTEND_URL}/auth/success?session={session_id}",
+            url=f"{FRONTEND_URL}/?session={session_id}",
             status_code=302
         )
         
