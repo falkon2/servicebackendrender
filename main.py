@@ -4,12 +4,9 @@ Secure FastAPI Backend for Reddit OAuth2 Web App
 
 This backend implements OAuth2 Authorization Code Flow for secure Reddit authentication.
 Users authenticate through Reddit's OAuth2 flow without exposing credentials.
-    except Exception as e:
-        logger.error(f"Callback error: {str(e)}")
-        return RedirectResponse(
-            url=f"{FRONTEND_URL}/?error=callback_failed",
-            status_code=302
-        )mport os
+"""
+
+import os
 import secrets
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, Depends
@@ -248,7 +245,7 @@ async def auth_callback(code: str, state: str, error: Optional[str] = None):
     except Exception as e:
         logger.error(f"Callback error: {str(e)}")
         return RedirectResponse(
-            url=f"{FRONTEND_URL}/auth/error?error=callback_failed",
+            url=f"{FRONTEND_URL}/?error=callback_failed",
             status_code=302
         )
 
