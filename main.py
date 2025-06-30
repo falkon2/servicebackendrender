@@ -154,7 +154,30 @@ async def exchange_code_for_token(code: str) -> Dict[str, Any]:
         
         return response.json()
 
-async def make_reddit_api_request(access_token: str, endpoint: str) -> Dict[str, Any]:
+async def get_total_count(access_token: str, endpoint: str) -> int:
+    """Get total count of posts or comments by fetching all pages"""
+    total_count = 0
+    after = None
+    
+    while True:
+        # Build URL with pagination
+        url = f"{endpoint}?limit=100"
+        if after:
+            url += f"&after={after}"
+            
+        data = await make_reddit_api_request(access_token, url)
+        children = data["data"]["children"]
+        
+        if not children:
+            break
+            
+        total_count += len(children)
+        after = data["data"].get("after")
+        
+        if not after:
+            break
+            
+    return total_count
     """Make authenticated request to Reddit API"""
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -273,13 +296,11 @@ async def get_user_profile(session_id: str):
         # Get user identity
         me_data = await make_reddit_api_request(access_token, "/api/v1/me")
         
-        # Get user posts count
-        posts_data = await make_reddit_api_request(access_token, "/user/self/submitted?limit=100")
-        posts_count = len(posts_data["data"]["children"])
+        # Get user posts count (get all posts to count them properly)
+        posts_count = await get_total_count(access_token, "/user/self/submitted")
         
-        # Get user comments count  
-        comments_data = await make_reddit_api_request(access_token, "/user/self/comments?limit=100")
-        comments_count = len(comments_data["data"]["children"])
+        # Get user comments count (get all comments to count them properly)
+        comments_count = await get_total_count(access_token, "/user/self/comments")
         
         created_utc = me_data.get("created_utc", 0)
         created_date = datetime.fromtimestamp(created_utc).strftime('%Y-%m-%d') if created_utc else "Unknown"
