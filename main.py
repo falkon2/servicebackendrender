@@ -1,431 +1,380 @@
 #!/usr/bin/env python3
 """
-FastAPI Backend for Reddit Stats Website
+Secure FastAPI Backend for Reddit OAuth2 Web App
 
-This backend provides API endpoints for checking Reddit posts, comments, and user statistics
-using PRAW (Python Reddit API Wrapper).
+This backend implements OAuth2 Authorization Code Flow for secure Reddit authentication.
+Users authenticate through Reddit's OAuth2 flow without exposing credentials.
 """
 
 import os
-import praw
-from fastapi import FastAPI, HTTPException, Depends
+import secrets
+import httpx
+from fastapi import FastAPI, HTTPException, Request, Response, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse, JSONResponse
 from pydantic import BaseModel
+from typing import Optional, Dict, Any, List
+import logging
+from datetime import datetime, timedelta
+import base64
 from dotenv import load_dotenv
-from datetime import datetime
-from typing import List, Optional, Dict, Any
-import sys
 
-# Load environment variables
+# Load environment variables from .env file
 load_dotenv()
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 app = FastAPI(
-    title="Reddit Stats API",
-    description="API for retrieving Reddit user statistics, posts, and comments",
-    version="1.0.0"
+    title="Reddit OAuth2 API",
+    description="Secure Reddit API using OAuth2 Authorization Code Flow",
+    version="2.0.0"
 )
 
-# Add CORS middleware to allow frontend requests
+# Environment variables
+REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
+REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
+REDDIT_REDIRECT_URI = os.getenv("REDDIT_REDIRECT_URI")  # Should be your backend /callback URL
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+
+# Validate required environment variables
+required_vars = ["REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET", "REDDIT_REDIRECT_URI"]
+missing_vars = [var for var in required_vars if not os.getenv(var)]
+if missing_vars:
+    raise ValueError(f"Missing required environment variables: {missing_vars}")
+
+# CORS configuration
+origins = [
+    "http://localhost:3000",
+    "https://your-app.vercel.app",  # Replace with your actual Vercel domain
+    FRONTEND_URL
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],  # Frontend URLs
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Pydantic models for request/response
-class RedditCredentials(BaseModel):
-    client_id: str
-    client_secret: str
-    user_agent: str
-    username: str
-    password: str
+# In-memory session store (use Redis in production)
+sessions: Dict[str, Dict[str, Any]] = {}
 
-class PostResponse(BaseModel):
+# Reddit API endpoints
+REDDIT_AUTHORIZE_URL = "https://www.reddit.com/api/v1/authorize"
+REDDIT_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
+REDDIT_API_BASE = "https://oauth.reddit.com"
+
+# Pydantic models
+class UserProfile(BaseModel):
+    username: str
+    total_karma: int
+    link_karma: int
+    comment_karma: int
+    account_created: str
+    total_posts: int
+    total_comments: int
+
+class Post(BaseModel):
     title: str
     subreddit: str
     score: int
-    ups: int
-    downs: int
     num_comments: int
     created_utc: float
     created_time: str
     permalink: str
     url: str
     selftext: Optional[str] = None
-    content_preview: Optional[str] = None
 
-class CommentResponse(BaseModel):
+class Comment(BaseModel):
     subreddit: str
     post_title: str
     score: int
     created_utc: float
     created_time: str
     body: str
-    comment_preview: str
     permalink: str
-    url: str
 
-class UserStats(BaseModel):
-    username: str
-    account_created: str
-    link_karma: int
-    comment_karma: int
-    total_karma: int
-    total_posts: int
-    total_comments: int
+class AuthResponse(BaseModel):
+    auth_url: str
+    state: str
 
-class ErrorResponse(BaseModel):
-    error: str
-    message: str
+def generate_state() -> str:
+    """Generate a secure random state parameter for OAuth2"""
+    return secrets.token_urlsafe(32)
 
-# Global Reddit instance
-reddit_instance = None
-
-def get_reddit_instance():
-    """
-    Get or create Reddit instance using environment variables.
-    """
-    global reddit_instance
+def create_auth_url(state: str) -> str:
+    """Create Reddit OAuth2 authorization URL"""
+    scope = "identity read history"  # Minimal required scopes
+    duration = "temporary"  # Only temporary access
     
-    if reddit_instance is not None:
-        return reddit_instance
+    params = {
+        "client_id": REDDIT_CLIENT_ID,
+        "response_type": "code",
+        "state": state,
+        "redirect_uri": REDDIT_REDIRECT_URI,
+        "duration": duration,
+        "scope": scope
+    }
     
-    # Get credentials from environment variables
-    client_id = os.getenv('REDDIT_CLIENT_ID')
-    client_secret = os.getenv('REDDIT_CLIENT_SECRET')
-    user_agent = os.getenv('REDDIT_USER_AGENT')
-    username = os.getenv('REDDIT_USERNAME')
-    password = os.getenv('REDDIT_PASSWORD')
-    
-    # Check if all required credentials are provided
-    if not all([client_id, client_secret, user_agent, username, password]):
-        raise HTTPException(
-            status_code=500, 
-            detail="Missing Reddit API credentials in environment variables"
-        )
-    
-    try:
-        # Create Reddit instance
-        reddit_instance = praw.Reddit(
-            client_id=client_id,
-            client_secret=client_secret,
-            user_agent=user_agent,
-            username=username,
-            password=password
-        )
-        
-        # Test the connection
-        reddit_instance.user.me()
-        return reddit_instance
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error connecting to Reddit: {str(e)}")
+    query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+    return f"{REDDIT_AUTHORIZE_URL}?{query_string}"
 
-def create_reddit_instance_with_credentials(credentials: RedditCredentials):
-    """
-    Create Reddit instance with provided credentials.
-    """
-    try:
-        reddit = praw.Reddit(
-            client_id=credentials.client_id,
-            client_secret=credentials.client_secret,
-            user_agent=credentials.user_agent,
-            username=credentials.username,
-            password=credentials.password
+async def exchange_code_for_token(code: str) -> Dict[str, Any]:
+    """Exchange authorization code for access token"""
+    # Create basic auth header
+    auth_string = f"{REDDIT_CLIENT_ID}:{REDDIT_CLIENT_SECRET}"
+    auth_bytes = auth_string.encode('utf-8')
+    auth_b64 = base64.b64encode(auth_bytes).decode('utf-8')
+    
+    headers = {
+        "Authorization": f"Basic {auth_b64}",
+        "User-Agent": "RedditOAuth2App/1.0"
+    }
+    
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": REDDIT_REDIRECT_URI
+    }
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            REDDIT_TOKEN_URL,
+            headers=headers,
+            data=data
         )
         
-        # Test the connection
-        reddit.user.me()
-        return reddit
+        if response.status_code != 200:
+            logger.error(f"Token exchange failed: {response.status_code} {response.text}")
+            raise HTTPException(status_code=400, detail="Failed to exchange code for token")
         
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Error connecting to Reddit: {str(e)}")
+        return response.json()
+
+async def make_reddit_api_request(access_token: str, endpoint: str) -> Dict[str, Any]:
+    """Make authenticated request to Reddit API"""
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "User-Agent": "RedditOAuth2App/1.0"
+    }
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{REDDIT_API_BASE}{endpoint}", headers=headers)
+        
+        if response.status_code != 200:
+            logger.error(f"Reddit API request failed: {response.status_code} {response.text}")
+            raise HTTPException(status_code=400, detail="Failed to fetch data from Reddit")
+        
+        return response.json()
 
 @app.get("/")
-def read_root():
-    """
-    Root endpoint with API information.
-    """
+async def root():
+    """API information"""
     return {
-        "message": "Welcome to the Reddit Stats Website API!",
-        "version": "1.0.0",
-        "endpoints": {
-            "user_stats": "/api/user/stats",
-            "posts": "/api/user/posts",
-            "comments": "/api/user/comments",
-            "health": "/health"
-        }
+        "message": "Reddit OAuth2 API",
+        "version": "2.0.0",
+        "auth_endpoint": "/auth/login",
+        "docs": "/docs"
     }
 
 @app.get("/health")
-def health_check():
-    """
-    Health check endpoint.
-    """
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
-@app.get("/api/user/stats", response_model=UserStats)
-def get_user_stats(reddit: praw.Reddit = Depends(get_reddit_instance)):
-    """
-    Get user statistics including karma, account age, and activity counts.
-    """
+@app.get("/auth/login", response_model=AuthResponse)
+async def login():
+    """Initiate OAuth2 flow - returns Reddit authorization URL"""
+    state = generate_state()
+    auth_url = create_auth_url(state)
+    
+    # Store state for validation (in production, use Redis with expiration)
+    sessions[state] = {
+        "created_at": datetime.utcnow(),
+        "used": False
+    }
+    
+    return AuthResponse(auth_url=auth_url, state=state)
+
+@app.get("/auth/callback")
+async def auth_callback(code: str, state: str, error: Optional[str] = None):
+    """OAuth2 callback endpoint - Reddit redirects here after user authorization"""
+    
+    if error:
+        logger.error(f"OAuth2 error: {error}")
+        return RedirectResponse(
+            url=f"{FRONTEND_URL}/auth/error?error={error}",
+            status_code=302
+        )
+    
+    # Validate state parameter
+    if state not in sessions or sessions[state]["used"]:
+        logger.error(f"Invalid or used state: {state}")
+        return RedirectResponse(
+            url=f"{FRONTEND_URL}/auth/error?error=invalid_state",
+            status_code=302
+        )
+    
+    # Mark state as used
+    sessions[state]["used"] = True
+    
     try:
-        user = reddit.user.me()
+        # Exchange code for access token
+        token_data = await exchange_code_for_token(code)
+        access_token = token_data["access_token"]
         
-        # Count posts and comments
-        post_count = sum(1 for _ in user.submissions.new(limit=None))
-        comment_count = sum(1 for _ in user.comments.new(limit=None))
+        # Generate session ID
+        session_id = secrets.token_urlsafe(32)
         
-        return UserStats(
-            username=user.name,
-            account_created=datetime.fromtimestamp(user.created_utc).strftime('%Y-%m-%d'),
-            link_karma=user.link_karma,
-            comment_karma=user.comment_karma,
-            total_karma=user.link_karma + user.comment_karma,
-            total_posts=post_count,
-            total_comments=comment_count
+        # Store session (in production, use Redis with expiration)
+        sessions[session_id] = {
+            "access_token": access_token,
+            "created_at": datetime.utcnow(),
+            "expires_at": datetime.utcnow() + timedelta(seconds=token_data.get("expires_in", 3600))
+        }
+        
+        # Redirect to frontend with session ID
+        return RedirectResponse(
+            url=f"{FRONTEND_URL}/auth/success?session={session_id}",
+            status_code=302
         )
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving user stats: {str(e)}")
+        logger.error(f"Callback error: {str(e)}")
+        return RedirectResponse(
+            url=f"{FRONTEND_URL}/auth/error?error=callback_failed",
+            status_code=302
+        )
 
-@app.get("/api/user/posts", response_model=List[PostResponse])
-def get_user_posts(
-    limit: int = 10,
-    sort_order: str = "newest",
-    reddit: praw.Reddit = Depends(get_reddit_instance)
-):
-    """
-    Get user's posts.
+def get_session(session_id: str) -> Dict[str, Any]:
+    """Get and validate session"""
+    if not session_id or session_id not in sessions:
+        raise HTTPException(status_code=401, detail="Invalid session")
     
-    Args:
-        limit: Number of posts to retrieve (default: 10)
-        sort_order: "oldest" or "newest" (default: "newest")
-    """
-    if sort_order not in ["oldest", "newest"]:
-        raise HTTPException(status_code=400, detail="sort_order must be 'oldest' or 'newest'")
+    session = sessions[session_id]
+    
+    # Check if session is expired
+    if datetime.utcnow() > session.get("expires_at", datetime.utcnow()):
+        del sessions[session_id]
+        raise HTTPException(status_code=401, detail="Session expired")
+    
+    return session
+
+@app.get("/api/profile", response_model=UserProfile)
+async def get_user_profile(session_id: str):
+    """Get user profile information"""
+    session = get_session(session_id)
+    access_token = session["access_token"]
     
     try:
-        user = reddit.user.me()
+        # Get user identity
+        me_data = await make_reddit_api_request(access_token, "/api/v1/me")
+        
+        # Get user posts count
+        posts_data = await make_reddit_api_request(access_token, "/user/self/submitted?limit=100")
+        posts_count = len(posts_data["data"]["children"])
+        
+        # Get user comments count  
+        comments_data = await make_reddit_api_request(access_token, "/user/self/comments?limit=100")
+        comments_count = len(comments_data["data"]["children"])
+        
+        created_utc = me_data.get("created_utc", 0)
+        created_date = datetime.fromtimestamp(created_utc).strftime('%Y-%m-%d') if created_utc else "Unknown"
+        
+        return UserProfile(
+            username=me_data.get("name", "Unknown"),
+            total_karma=me_data.get("total_karma", 0),
+            link_karma=me_data.get("link_karma", 0),
+            comment_karma=me_data.get("comment_karma", 0),
+            account_created=created_date,
+            total_posts=posts_count,
+            total_comments=comments_count
+        )
+        
+    except Exception as e:
+        logger.error(f"Profile fetch error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch profile")
+
+@app.get("/api/posts", response_model=List[Post])
+async def get_user_posts(session_id: str, limit: int = 10):
+    """Get user's recent posts"""
+    session = get_session(session_id)
+    access_token = session["access_token"]
+    
+    try:
+        posts_data = await make_reddit_api_request(
+            access_token, 
+            f"/user/self/submitted?limit={min(limit, 25)}"
+        )
+        
         posts = []
-        
-        if sort_order == "oldest":
-            # Get all posts and sort by creation time
-            all_posts = list(user.submissions.new(limit=None))
-            all_posts.sort(key=lambda x: x.created_utc)
-            selected_posts = all_posts[:limit]
-        else:
-            # Get newest posts directly
-            selected_posts = user.submissions.new(limit=limit)
-        
-        for post in selected_posts:
-            created_time = datetime.fromtimestamp(post.created_utc)
+        for post_data in posts_data["data"]["children"]:
+            post = post_data["data"]
+            created_time = datetime.fromtimestamp(post["created_utc"]).strftime('%Y-%m-%d %H:%M:%S')
             
-            # Create content preview for text posts
-            content_preview = None
-            if post.selftext:
-                content_preview = post.selftext[:200] + "..." if len(post.selftext) > 200 else post.selftext
-            
-            posts.append(PostResponse(
-                title=post.title,
-                subreddit=post.subreddit.display_name,
-                score=post.score,
-                ups=post.ups,
-                downs=post.downs,
-                num_comments=post.num_comments,
-                created_utc=post.created_utc,
-                created_time=created_time.strftime('%Y-%m-%d %H:%M:%S'),
-                permalink=post.permalink,
-                url=f"https://reddit.com{post.permalink}",
-                selftext=post.selftext,
-                content_preview=content_preview
+            posts.append(Post(
+                title=post.get("title", ""),
+                subreddit=post.get("subreddit", ""),
+                score=post.get("score", 0),
+                num_comments=post.get("num_comments", 0),
+                created_utc=post.get("created_utc", 0),
+                created_time=created_time,
+                permalink=f"https://reddit.com{post.get('permalink', '')}",
+                url=post.get("url", ""),
+                selftext=post.get("selftext", None) if post.get("selftext") else None
             ))
         
         return posts
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving posts: {str(e)}")
+        logger.error(f"Posts fetch error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch posts")
 
-@app.get("/api/user/comments", response_model=List[CommentResponse])
-def get_user_comments(
-    limit: int = 10,
-    sort_order: str = "newest",
-    reddit: praw.Reddit = Depends(get_reddit_instance)
-):
-    """
-    Get user's comments.
-    
-    Args:
-        limit: Number of comments to retrieve (default: 10)
-        sort_order: "oldest" or "newest" (default: "newest")
-    """
-    if sort_order not in ["oldest", "newest"]:
-        raise HTTPException(status_code=400, detail="sort_order must be 'oldest' or 'newest'")
+@app.get("/api/comments", response_model=List[Comment])
+async def get_user_comments(session_id: str, limit: int = 10):
+    """Get user's recent comments"""
+    session = get_session(session_id)
+    access_token = session["access_token"]
     
     try:
-        user = reddit.user.me()
-        comments = []
-        
-        if sort_order == "oldest":
-            # Get all comments and sort by creation time
-            all_comments = list(user.comments.new(limit=None))
-            all_comments.sort(key=lambda x: x.created_utc)
-            selected_comments = all_comments[:limit]
-        else:
-            # Get newest comments directly
-            selected_comments = user.comments.new(limit=limit)
-        
-        for comment in selected_comments:
-            created_time = datetime.fromtimestamp(comment.created_utc)
-            
-            # Create comment preview
-            comment_preview = comment.body[:200] + "..." if len(comment.body) > 200 else comment.body
-            
-            comments.append(CommentResponse(
-                subreddit=comment.subreddit.display_name,
-                post_title=comment.submission.title,
-                score=comment.score,
-                created_utc=comment.created_utc,
-                created_time=created_time.strftime('%Y-%m-%d %H:%M:%S'),
-                body=comment.body,
-                comment_preview=comment_preview,
-                permalink=comment.permalink,
-                url=f"https://reddit.com{comment.permalink}"
-            ))
-        
-        return comments
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving comments: {str(e)}")
-
-@app.post("/api/user/stats/with-credentials", response_model=UserStats)
-def get_user_stats_with_credentials(credentials: RedditCredentials):
-    """
-    Get user statistics using provided credentials.
-    """
-    reddit = create_reddit_instance_with_credentials(credentials)
-    
-    try:
-        user = reddit.user.me()
-        
-        # Count posts and comments
-        post_count = sum(1 for _ in user.submissions.new(limit=None))
-        comment_count = sum(1 for _ in user.comments.new(limit=None))
-        
-        return UserStats(
-            username=user.name,
-            account_created=datetime.fromtimestamp(user.created_utc).strftime('%Y-%m-%d'),
-            link_karma=user.link_karma,
-            comment_karma=user.comment_karma,
-            total_karma=user.link_karma + user.comment_karma,
-            total_posts=post_count,
-            total_comments=comment_count
+        comments_data = await make_reddit_api_request(
+            access_token,
+            f"/user/self/comments?limit={min(limit, 25)}"
         )
         
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving user stats: {str(e)}")
-
-@app.post("/api/user/posts/with-credentials", response_model=List[PostResponse])
-def get_user_posts_with_credentials(
-    credentials: RedditCredentials,
-    limit: int = 10,
-    sort_order: str = "newest"
-):
-    """
-    Get user's posts using provided credentials.
-    """
-    if sort_order not in ["oldest", "newest"]:
-        raise HTTPException(status_code=400, detail="sort_order must be 'oldest' or 'newest'")
-    
-    reddit = create_reddit_instance_with_credentials(credentials)
-    
-    try:
-        user = reddit.user.me()
-        posts = []
-        
-        if sort_order == "oldest":
-            all_posts = list(user.submissions.new(limit=None))
-            all_posts.sort(key=lambda x: x.created_utc)
-            selected_posts = all_posts[:limit]
-        else:
-            selected_posts = user.submissions.new(limit=limit)
-        
-        for post in selected_posts:
-            created_time = datetime.fromtimestamp(post.created_utc)
-            
-            content_preview = None
-            if post.selftext:
-                content_preview = post.selftext[:200] + "..." if len(post.selftext) > 200 else post.selftext
-            
-            posts.append(PostResponse(
-                title=post.title,
-                subreddit=post.subreddit.display_name,
-                score=post.score,
-                ups=post.ups,
-                downs=post.downs,
-                num_comments=post.num_comments,
-                created_utc=post.created_utc,
-                created_time=created_time.strftime('%Y-%m-%d %H:%M:%S'),
-                permalink=post.permalink,
-                url=f"https://reddit.com{post.permalink}",
-                selftext=post.selftext,
-                content_preview=content_preview
-            ))
-        
-        return posts
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving posts: {str(e)}")
-
-@app.post("/api/user/comments/with-credentials", response_model=List[CommentResponse])
-def get_user_comments_with_credentials(
-    credentials: RedditCredentials,
-    limit: int = 10,
-    sort_order: str = "newest"
-):
-    """
-    Get user's comments using provided credentials.
-    """
-    if sort_order not in ["oldest", "newest"]:
-        raise HTTPException(status_code=400, detail="sort_order must be 'oldest' or 'newest'")
-    
-    reddit = create_reddit_instance_with_credentials(credentials)
-    
-    try:
-        user = reddit.user.me()
         comments = []
-        
-        if sort_order == "oldest":
-            all_comments = list(user.comments.new(limit=None))
-            all_comments.sort(key=lambda x: x.created_utc)
-            selected_comments = all_comments[:limit]
-        else:
-            selected_comments = user.comments.new(limit=limit)
-        
-        for comment in selected_comments:
-            created_time = datetime.fromtimestamp(comment.created_utc)
-            comment_preview = comment.body[:200] + "..." if len(comment.body) > 200 else comment.body
+        for comment_data in comments_data["data"]["children"]:
+            comment = comment_data["data"]
+            created_time = datetime.fromtimestamp(comment["created_utc"]).strftime('%Y-%m-%d %H:%M:%S')
             
-            comments.append(CommentResponse(
-                subreddit=comment.subreddit.display_name,
-                post_title=comment.submission.title,
-                score=comment.score,
-                created_utc=comment.created_utc,
-                created_time=created_time.strftime('%Y-%m-%d %H:%M:%S'),
-                body=comment.body,
-                comment_preview=comment_preview,
-                permalink=comment.permalink,
-                url=f"https://reddit.com{comment.permalink}"
+            comments.append(Comment(
+                subreddit=comment.get("subreddit", ""),
+                post_title=comment.get("link_title", "Unknown Post"),
+                score=comment.get("score", 0),
+                created_utc=comment.get("created_utc", 0),
+                created_time=created_time,
+                body=comment.get("body", ""),
+                permalink=f"https://reddit.com{comment.get('permalink', '')}"
             ))
         
         return comments
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving comments: {str(e)}")
+        logger.error(f"Comments fetch error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch comments")
+
+@app.delete("/auth/logout")
+async def logout(session_id: str):
+    """Logout user by invalidating session"""
+    if session_id in sessions:
+        del sessions[session_id]
+    
+    return {"message": "Logged out successfully"}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-    
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
